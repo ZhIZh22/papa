@@ -55,14 +55,13 @@ def _ensure_sheet(wb, sheet_name: str):
 
 
 def _last_used_row(ws) -> int:
-    """Последняя строка где есть хоть что-то в любом из 4 столбцов (>= 4), или 3."""
-    last = 3
-    for row_idx in range(4, ws.max_row + 1):
+    """Последняя строка где есть хоть что-то в любом из 4 столбцов (>= 4), или 3.
+    Идём с конца чтобы правильно пропустить пустые строки в конце таблицы."""
+    for row_idx in range(ws.max_row, 3, -1):
         for col in range(1, 5):
             if ws.cell(row=row_idx, column=col).value not in (None, ""):
-                last = row_idx
-                break
-    return last
+                return row_idx
+    return 3
 
 
 def _rows_with_dates(ws) -> dict:

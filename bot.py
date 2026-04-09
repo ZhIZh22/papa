@@ -76,9 +76,9 @@ def totals_text(year: int) -> str:
     t = excel_helper.get_totals(year)
     return (
         f"📊 Итоги {year}:\n"
-        f"  Доход:   {fmt_money(t['income'])[1:]} ₽\n"
-        f"  Расход:  {fmt_money(t['expense'])[1:]} ₽\n"
-        f"  Остаток: {fmt_money(t['balance'])} ₽"
+        f"  Доход:   {fmt_money(t['income'])[1:]}\n"
+        f"  Расход:  {fmt_money(t['expense'])[1:]}\n"
+        f"  Остаток: {fmt_money(t['balance'])}"
     )
 
 

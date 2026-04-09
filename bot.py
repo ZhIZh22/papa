@@ -452,6 +452,7 @@ def main():
             ],
         },
         fallbacks=[],
+        allow_reentry=True,
         per_message=False,
     )
 
@@ -473,17 +474,18 @@ def main():
                 CallbackQueryHandler(skip_comment_callback, pattern="^skip_comment$"),
             ],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("add", cmd_add)],
+        allow_reentry=True,
         per_message=False,
     )
 
+    app.add_handler(add_conv)
+    app.add_handler(quick_conv)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("totals", cmd_totals))
     app.add_handler(CommandHandler("download", cmd_download))
     app.add_handler(CommandHandler("upload", cmd_upload))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(quick_conv)
-    app.add_handler(add_conv)
 
     logger.info("Бот запущен.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

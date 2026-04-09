@@ -16,6 +16,7 @@ from telegram.ext import (
 
 load_dotenv()
 import excel_helper
+import pending_manager
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -33,12 +34,11 @@ RUSSIAN_MONTHS = {
     9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
 }
 
-# Режимы ожидания в user_data["mode"]
-MODE_WAIT_COMMENT = "wait_comment"
+MODE_WAIT_COMMENT        = "wait_comment"
 MODE_WAIT_AMOUNT_FOR_DATE = "wait_amount_for_date"
 MODE_WAIT_COMMENT_FOR_DATE = "wait_comment_for_date"
-MODE_WAIT_CUSTOM_DATE = "wait_custom_date"
-MODE_WAIT_UPLOAD = "wait_upload"
+MODE_WAIT_CUSTOM_DATE    = "wait_custom_date"
+MODE_WAIT_UPLOAD         = "wait_upload"
 
 
 def fmt_date_ru(d: date) -> str:
@@ -58,13 +58,11 @@ def fmt_money(n: int) -> str:
 
 def parse_amount(text: str):
     text = text.strip().replace("\xa0", "")
-    # Убираем пробелы только внутри числа, но сохраняем текст после
     m = re.match(r"^([+-]?\s*[\d\s]+?)([^\d\s].*)$", text)
     if m:
         num_part = m.group(1).replace(" ", "")
         rest = m.group(2).strip()
     else:
-        # Только число
         num_part = text.replace(" ", "")
         rest = ""
     try:
@@ -93,11 +91,40 @@ async def deny(update: Update):
 
 
 def clear_mode(context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("mode", None)
-    context.user_data.pop("pending_amount", None)
-    context.user_data.pop("pending_date", None)
-    context.user_data.pop("add_date", None)
-    context.user_data.pop("waiting_upload", None)
+    for key in ("mode", "pending_amount", "pending_date", "add_date"):
+        context.user_data.pop(key, None)
+
+
+# ── Flush pending при старте ──────────────────────────────────────────────────
+
+async def flush_pending(app: Application):
+    """Записывает в Excel все pending-транзакции с датой <= сегодня."""
+    today = date.today()
+    due = pending_manager.get_due(today)
+    if not due:
+        return
+
+    # Сортируем по дате чтобы вставлять по порядку
+    due_sorted = sorted(due, key=lambda x: x["date"])
+    for item in due_sorted:
+        excel_helper.add_transaction(item["date"], item["amount"], item["comment"])
+        logger.info(f"Flush pending: {item['date']} {item['amount']} {item['comment']}")
+
+    pending_manager.remove_due(today)
+
+    # Уведомляем всех разрешённых пользователей
+    lines = [f"📥 Записаны отложенные транзакции ({len(due_sorted)} шт.):"]
+    for item in due_sorted:
+        direction = "Доход" if item["amount"] > 0 else "Расход"
+        lines.append(f"  {fmt_date_ru(item['date'])} | {direction}: {fmt_money(item['amount'])}"
+                     + (f" | {item['comment']}" if item["comment"] else ""))
+    text = "\n".join(lines)
+
+    for user_id in ALLOWED_USERS:
+        try:
+            await app.bot.send_message(chat_id=user_id, text=text)
+        except Exception as e:
+            logger.warning(f"Не удалось отправить уведомление {user_id}: {e}")
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -115,6 +142,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Комментарий необязателен.\n\n"
         "Команды:\n"
         "  /add — запись на другую дату\n"
+        "  /pending — будущие транзакции\n"
         "  /download — скачать таблицу\n"
         "  /upload — загрузить таблицу\n"
         "  /totals — итоги за год",
@@ -180,6 +208,65 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Таблица обновлена!")
 
 
+# ── /pending ──────────────────────────────────────────────────────────────────
+
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        await deny(update)
+        return
+    clear_mode(context)
+    items = pending_manager.get_all()
+    if not items:
+        await update.message.reply_text("Нет запланированных транзакций.")
+        return
+
+    items_sorted = sorted(items, key=lambda x: x["date"])
+    lines = ["📋 Запланированные транзакции:\n"]
+    for i, item in enumerate(items_sorted):
+        direction = "Доход" if item["amount"] > 0 else "Расход"
+        comment_part = f" | {item['comment']}" if item["comment"] else ""
+        lines.append(f"{i+1}. {fmt_date_ru(item['date'])} | {direction}: {fmt_money(item['amount'])}{comment_part}")
+
+    keyboard = []
+    for i in range(len(items_sorted)):
+        keyboard.append([InlineKeyboardButton(f"Удалить #{i+1}", callback_data=f"del_pending_{i}")])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def callback_del_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_allowed(update):
+        await query.edit_message_text("⛔ Нет доступа.")
+        return
+
+    idx = int(query.data.replace("del_pending_", ""))
+    items = sorted(pending_manager.get_all(), key=lambda x: x["date"])
+    if idx >= len(items):
+        await query.edit_message_text("Транзакция не найдена (уже удалена?).")
+        return
+
+    # Найдём реальный индекс в несортированном списке
+    target = items[idx]
+    all_items = pending_manager.get_all()
+    for real_idx, item in enumerate(all_items):
+        if (item["date"] == target["date"] and
+                item["amount"] == target["amount"] and
+                item["comment"] == target["comment"]):
+            pending_manager.remove_by_index(real_idx)
+            break
+
+    direction = "Доход" if target["amount"] > 0 else "Расход"
+    await query.edit_message_text(
+        f"🗑 Удалено: {fmt_date_ru(target['date'])} | {direction}: {fmt_money(target['amount'])}"
+        + (f" | {target['comment']}" if target["comment"] else "")
+    )
+
+
 # ── /add — выбор даты ─────────────────────────────────────────────────────────
 
 def date_picker_keyboard() -> InlineKeyboardMarkup:
@@ -215,13 +302,11 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_date_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if not is_allowed(update):
         await query.edit_message_text("⛔ Нет доступа.")
         return
 
     data = query.data
-
     if data == "date_manual":
         clear_mode(context)
         context.user_data["mode"] = MODE_WAIT_CUSTOM_DATE
@@ -232,8 +317,10 @@ async def callback_date_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     clear_mode(context)
     context.user_data["mode"] = MODE_WAIT_AMOUNT_FOR_DATE
     context.user_data["add_date"] = chosen_date
+
+    future_mark = " (будет записано в день наступления)" if chosen_date > date.today() else ""
     await query.edit_message_text(
-        f"Дата: {fmt_date_ru(chosen_date)}\n\n"
+        f"Дата: {fmt_date_ru(chosen_date)}{future_mark}\n\n"
         "Отправь сумму с + или −:\n"
         "<code>+5000 аванс</code>\n"
         "<code>-1200</code>",
@@ -244,7 +331,6 @@ async def callback_date_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def callback_skip_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if not is_allowed(update):
         await query.edit_message_text("⛔ Нет доступа.")
         return
@@ -257,17 +343,27 @@ async def callback_skip_comment(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Нет ожидающей транзакции.")
         return
 
-    excel_helper.add_transaction(target_date, amount, "")
-    direction = "Доход" if amount > 0 else "Расход"
-    await query.edit_message_text(
-        f"✅ Записано на {fmt_date_ru(target_date)}\n"
-        f"{direction}: {fmt_money(amount)}\n"
-        f"Без комментария.\n\n"
-        + totals_text(target_date.year)
-    )
+    today = date.today()
+    if target_date > today:
+        pending_manager.add(target_date, amount, "")
+        direction = "Доход" if amount > 0 else "Расход"
+        await query.edit_message_text(
+            f"🕐 Запланировано на {fmt_date_ru(target_date)}\n"
+            f"{direction}: {fmt_money(amount)}\n"
+            f"Без комментария."
+        )
+    else:
+        excel_helper.add_transaction(target_date, amount, "")
+        direction = "Доход" if amount > 0 else "Расход"
+        await query.edit_message_text(
+            f"✅ Записано на {fmt_date_ru(target_date)}\n"
+            f"{direction}: {fmt_money(amount)}\n"
+            f"Без комментария.\n\n"
+            + totals_text(target_date.year)
+        )
 
 
-# ── Основной обработчик текстовых сообщений ──────────────────────────────────
+# ── Основной обработчик текста ────────────────────────────────────────────────
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
@@ -276,8 +372,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
     mode = context.user_data.get("mode")
+    today = date.today()
 
-    # Ждём дату вручную
+    # ── Ждём дату вручную
     if mode == MODE_WAIT_CUSTOM_DATE:
         try:
             chosen_date = datetime.strptime(text, "%d.%m.%y").date()
@@ -289,8 +386,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         context.user_data["mode"] = MODE_WAIT_AMOUNT_FOR_DATE
         context.user_data["add_date"] = chosen_date
+        future_mark = " (будет записано в день наступления)" if chosen_date > today else ""
         await update.message.reply_text(
-            f"Дата: {fmt_date_ru(chosen_date)}\n\n"
+            f"Дата: {fmt_date_ru(chosen_date)}{future_mark}\n\n"
             "Отправь сумму с + или −:\n"
             "<code>+5000 аванс</code>\n"
             "<code>-1200</code>",
@@ -298,7 +396,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Ждём сумму для выбранной даты
+    # ── Ждём сумму для выбранной даты
     if mode == MODE_WAIT_AMOUNT_FOR_DATE:
         amount, comment = parse_amount(text)
         if amount is None or amount == 0:
@@ -308,67 +406,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
             )
             return
-        target_date = context.user_data.get("add_date", date.today())
+        target_date = context.user_data.get("add_date", today)
         if comment:
-            excel_helper.add_transaction(target_date, amount, comment)
-            clear_mode(context)
-            direction = "Доход" if amount > 0 else "Расход"
-            await update.message.reply_text(
-                f"✅ Записано на {fmt_date_ru(target_date)}\n"
-                f"{direction}: {fmt_money(amount)}\n"
-                f"Комментарий: {comment}\n\n"
-                + totals_text(target_date.year)
-            )
+            await _save_transaction(update, context, target_date, amount, comment)
         else:
             context.user_data["mode"] = MODE_WAIT_COMMENT_FOR_DATE
             context.user_data["pending_amount"] = amount
             context.user_data["pending_date"] = target_date
             day_info = excel_helper.get_day_info(target_date)
-            has_previous = day_info["income"] > 0 or day_info["expense"] > 0
             direction = "доход" if amount > 0 else "расход"
             text_ask = f"Записать {direction} {fmt_money(amount)} на {fmt_date_ru(target_date)}.\nНапиши комментарий:"
-            if has_previous:
+            if day_info["has_records"] and target_date <= today:
                 kb = [[InlineKeyboardButton("Пропустить комментарий", callback_data="skip_comment")]]
                 await update.message.reply_text(text_ask, reply_markup=InlineKeyboardMarkup(kb))
             else:
                 await update.message.reply_text(text_ask)
         return
 
-    # Ждём комментарий для выбранной даты
+    # ── Ждём комментарий для выбранной даты
     if mode == MODE_WAIT_COMMENT_FOR_DATE:
-        comment = text
         amount = context.user_data.pop("pending_amount", None)
-        target_date = context.user_data.pop("pending_date", date.today())
+        target_date = context.user_data.pop("pending_date", today)
         clear_mode(context)
         if amount is not None:
-            excel_helper.add_transaction(target_date, amount, comment)
-            direction = "Доход" if amount > 0 else "Расход"
-            await update.message.reply_text(
-                f"✅ Записано на {fmt_date_ru(target_date)}\n"
-                f"{direction}: {fmt_money(amount)}\n"
-                f"Комментарий: {comment}\n\n"
-                + totals_text(target_date.year)
-            )
+            await _save_transaction(update, context, target_date, amount, text)
         return
 
-    # Ждём комментарий для быстрого ввода (сегодня)
+    # ── Ждём комментарий для сегодня
     if mode == MODE_WAIT_COMMENT:
-        comment = text
         amount = context.user_data.pop("pending_amount", None)
-        target_date = context.user_data.pop("pending_date", date.today())
+        target_date = context.user_data.pop("pending_date", today)
         clear_mode(context)
         if amount is not None:
-            excel_helper.add_transaction(target_date, amount, comment)
-            direction = "Доход" if amount > 0 else "Расход"
-            await update.message.reply_text(
-                f"✅ Записано на {fmt_date_ru(target_date)}\n"
-                f"{direction}: {fmt_money(amount)}\n"
-                f"Комментарий: {comment}\n\n"
-                + totals_text(target_date.year)
-            )
+            await _save_transaction(update, context, target_date, amount, text)
         return
 
-    # Быстрый ввод суммы (сегодня)
+    # ── Быстрый ввод суммы (сегодня)
     if re.match(r"^[+-]", text):
         amount, comment = parse_amount(text)
         if amount is None or amount == 0:
@@ -379,26 +452,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
             )
             return
-        today = date.today()
         if comment:
-            excel_helper.add_transaction(today, amount, comment)
-            clear_mode(context)
-            direction = "Доход" if amount > 0 else "Расход"
-            await update.message.reply_text(
-                f"✅ Записано на {fmt_date_ru(today)}\n"
-                f"{direction}: {fmt_money(amount)}\n"
-                f"Комментарий: {comment}\n\n"
-                + totals_text(today.year)
-            )
+            await _save_transaction(update, context, today, amount, comment)
         else:
             context.user_data["mode"] = MODE_WAIT_COMMENT
             context.user_data["pending_amount"] = amount
             context.user_data["pending_date"] = today
             day_info = excel_helper.get_day_info(today)
-            has_previous = day_info["income"] > 0 or day_info["expense"] > 0
             direction = "доход" if amount > 0 else "расход"
             text_ask = f"Записать {direction} {fmt_money(amount)} на {fmt_date_ru(today)}.\nНапиши комментарий:"
-            if has_previous:
+            if day_info["has_records"]:
                 kb = [[InlineKeyboardButton("Пропустить комментарий", callback_data="skip_comment")]]
                 await update.message.reply_text(text_ask, reply_markup=InlineKeyboardMarkup(kb))
             else:
@@ -414,6 +477,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _save_transaction(update, context, target_date: date, amount: int, comment: str):
+    """Сохраняет транзакцию: в Excel если дата <= сегодня, иначе в pending."""
+    today = date.today()
+    clear_mode(context)
+    direction = "Доход" if amount > 0 else "Расход"
+
+    if target_date > today:
+        pending_manager.add(target_date, amount, comment)
+        await update.message.reply_text(
+            f"🕐 Запланировано на {fmt_date_ru(target_date)}\n"
+            f"{direction}: {fmt_money(amount)}"
+            + (f"\nКомментарий: {comment}" if comment else "")
+        )
+    else:
+        excel_helper.add_transaction(target_date, amount, comment)
+        await update.message.reply_text(
+            f"✅ Записано на {fmt_date_ru(target_date)}\n"
+            f"{direction}: {fmt_money(amount)}"
+            + (f"\nКомментарий: {comment}" if comment else "")
+            + "\n\n" + totals_text(target_date.year)
+        )
+
+
 # ── Запуск ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -422,14 +508,19 @@ def main():
         builder = builder.proxy(PROXY_URL).get_updates_proxy(PROXY_URL)
     app = builder.build()
 
+    # Flush pending при старте
+    app.job_queue.run_once(lambda ctx: flush_pending(app), when=0)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("totals", cmd_totals))
     app.add_handler(CommandHandler("download", cmd_download))
     app.add_handler(CommandHandler("upload", cmd_upload))
     app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(callback_date_pick, pattern="^date_"))
     app.add_handler(CallbackQueryHandler(callback_skip_comment, pattern="^skip_comment$"))
+    app.add_handler(CallbackQueryHandler(callback_del_pending, pattern="^del_pending_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Бот запущен.")

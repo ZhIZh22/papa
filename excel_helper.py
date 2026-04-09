@@ -1,8 +1,9 @@
 import os
 import shutil
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Border, Side
+from openpyxl.styles.numbers import FORMAT_DATE_DDMMYY
 
 EXCEL_FILE = os.getenv("EXCEL_FILE", "!!!Мастерская.xlsx")
 
@@ -10,6 +11,9 @@ _THIN = Side(style="thin")
 _BORDER = Border(left=_THIN, right=_THIN)
 _ALIGN_CENTER = Alignment(horizontal="center", vertical="center")
 _ALIGN_LEFT   = Alignment(horizontal="left",   vertical="center")
+
+# Формат даты как в оригинальной таблице: ДД.ММ.ГГ
+DATE_FORMAT = "DD.MM.YY"
 
 
 def _apply_row_style(ws, row_idx: int):
@@ -23,18 +27,30 @@ def _get_sheet_name(year: int) -> str:
     return str(year)[-2:]
 
 
-def _parse_money(s):
+def _parse_money(s) -> int:
     if s is None:
-        return None
-    s = str(s).replace(" ", "").replace("\xa0", "")
-    try:
+        return 0
+    if isinstance(s, (int, float)):
         return int(s)
+    s = str(s).replace(" ", "").replace("\xa0", "").replace(",", "")
+    try:
+        return int(float(s))
     except ValueError:
+        return 0
+
+
+def _cell_as_date(cell) -> date | None:
+    """Читает дату из ячейки — поддерживает datetime, date и строки."""
+    val = cell.value
+    if val is None:
         return None
-
-
-def _parse_date(s: str) -> date | None:
-    for fmt in ("%d.%m.%y", "%d.%m.%Y"):
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    # Строка — пробуем распарсить
+    s = str(val).strip()
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:
@@ -49,97 +65,65 @@ def _ensure_sheet(wb, sheet_name: str):
         ws["B1"] = "Приход"
         ws["C1"] = "Расход"
         ws["D1"] = "Комментарий"
-        ws["A2"] = "Итого:"
-        ws["A3"] = "Остаток:"
+        ws["A3"] = "остаток"
     return wb[sheet_name]
 
 
 def _last_used_row(ws) -> int:
-    """Последняя строка где есть хоть что-то в любом из 4 столбцов (>= 4), или 3.
-    Идём с конца чтобы правильно пропустить пустые строки в конце таблицы."""
+    """Последняя строка с данными в любом из столбцов A-D (>= 4), иначе 3."""
     for row_idx in range(ws.max_row, 3, -1):
         for col in range(1, 5):
-            if ws.cell(row=row_idx, column=col).value not in (None, ""):
+            v = ws.cell(row=row_idx, column=col).value
+            if v is not None and str(v).strip() != "":
                 return row_idx
     return 3
 
 
-def _rows_with_dates(ws) -> dict:
-    """Возвращает {row_idx: date} для всех строк с датой в столбце A."""
-    result = {}
-    for row_idx in range(4, ws.max_row + 1):
-        val = ws.cell(row=row_idx, column=1).value
-        if val:
-            d = _parse_date(str(val).strip())
-            if d:
-                result[row_idx] = d
-    return result
-
-
 def _find_row_by_date(ws, target_date: date) -> int | None:
-    """Ищет строку по дате, поддерживает оба формата: ДД.ММ.ГГ и ДД.ММ.ГГГГ."""
+    """Находит первую строку с нужной датой в столбце A."""
     for row_idx in range(4, ws.max_row + 1):
-        val = ws.cell(row=row_idx, column=1).value
-        if val:
-            d = _parse_date(str(val).strip())
-            if d == target_date:
-                return row_idx
+        d = _cell_as_date(ws.cell(row=row_idx, column=1))
+        if d == target_date:
+            return row_idx
     return None
 
 
-def _insert_new_row_for_date(ws, target_date: date) -> int:
+def _last_row_of_day(ws, first_row: int) -> int:
     """
-    Вставляет новую пустую строку в правильное место по дате.
-    Возвращает номер новой строки.
+    Возвращает последнюю строку принадлежащую дню начатому в first_row.
+    Строки без даты в A считаются продолжением предыдущего дня.
     """
-    dated = _rows_with_dates(ws)
+    last = first_row
+    row_idx = first_row + 1
+    while row_idx <= ws.max_row:
+        # Если в A есть дата — начался новый день
+        if _cell_as_date(ws.cell(row=row_idx, column=1)) is not None:
+            break
+        # Если есть данные в B/C/D — это строка нашего дня
+        has_data = any(
+            ws.cell(row=row_idx, column=c).value not in (None, "")
+            for c in range(2, 5)
+        )
+        if has_data:
+            last = row_idx
+        row_idx += 1
+    return last
 
-    if not dated:
-        row = 4
-        ws.cell(row=row, column=1).value = target_date.strftime("%d.%m.%y")
-        _apply_row_style(ws, row)
-        return row
 
-    last_date = max(dated.values())
-
-    if target_date >= last_date:
-        # Дата позже или равна последней — добавляем в конец после последней использованной строки
-        row = _last_used_row(ws) + 1
-        ws.cell(row=row, column=1).value = target_date.strftime("%d.%m.%y")
-        _apply_row_style(ws, row)
-        return row
-
-    # Дата раньше последней — вставляем в нужное место через insert_rows
-    insert_after = 3
-    for row_idx in sorted(dated.keys()):
-        if dated[row_idx] < target_date:
-            # Учитываем все строки этого дня (без даты в A)
-            insert_after = row_idx
-            next_row = row_idx + 1
-            while next_row <= ws.max_row:
-                if ws.cell(row=next_row, column=1).value:
-                    break
-                has_data = any(
-                    ws.cell(row=next_row, column=c).value not in (None, "")
-                    for c in range(2, 5)
-                )
-                if has_data:
-                    insert_after = next_row
-                next_row += 1
-
-    insert_at = insert_after + 1
-    ws.insert_rows(insert_at)
-    ws.cell(row=insert_at, column=1).value = target_date.strftime("%d.%m.%y")
-    _apply_row_style(ws, insert_at)
-    return insert_at
+def _write_date_cell(cell, d: date):
+    """Записывает дату в ячейку как datetime с форматированием ДД.ММ.ГГ."""
+    cell.value = datetime(d.year, d.month, d.day)
+    cell.number_format = DATE_FORMAT
+    cell.alignment = _ALIGN_CENTER
+    cell.border = _BORDER
 
 
 def add_transaction(target_date: date, amount: int, comment: str = "") -> dict:
     """
     Каждая транзакция — отдельная строка.
-    Первая транзакция за день: дата в столбце A.
-    Последующие в тот же день: дата не пишется, строка добавляется после последней строки этого дня.
-    Запись на прошлое число: вставляется новая строка рядом с нужной датой.
+    Первая за день: дата в A, потом сумма и комментарий.
+    Следующие за тот же день: без даты, строка добавляется после последней строки дня.
+    Прошлое число: вставляется строка через insert_rows рядом с нужной датой.
     """
     wb = load_workbook(EXCEL_FILE)
     sheet_name = _get_sheet_name(target_date.year)
@@ -148,32 +132,52 @@ def add_transaction(target_date: date, amount: int, comment: str = "") -> dict:
     first_row = _find_row_by_date(ws, target_date)
 
     if first_row is None:
-        # Даты нет вообще — вставляем новую строку с датой
-        row_idx = _insert_new_row_for_date(ws, target_date)
+        # Даты нет в таблице
+        # Находим все даты чтобы понять куда вставить
+        dated_rows = {}  # row_idx -> date
+        for r in range(4, ws.max_row + 1):
+            d = _cell_as_date(ws.cell(row=r, column=1))
+            if d is not None:
+                dated_rows[r] = d
+
+        if not dated_rows or target_date >= max(dated_rows.values()):
+            # Нет данных вообще или дата >= последней — добавляем в конец
+            row_idx = _last_used_row(ws) + 1
+            _apply_row_style(ws, row_idx)
+            _write_date_cell(ws.cell(row=row_idx, column=1), target_date)
+        else:
+            # Дата в прошлом — вставляем insert_rows после нужного места
+            insert_after = 3
+            for r in sorted(dated_rows.keys()):
+                if dated_rows[r] < target_date:
+                    # Учитываем все строки этого дня
+                    insert_after = _last_row_of_day(ws, r)
+
+            insert_at = insert_after + 1
+            ws.insert_rows(insert_at)
+            _apply_row_style(ws, insert_at)
+            _write_date_cell(ws.cell(row=insert_at, column=1), target_date)
+            row_idx = insert_at
     else:
-        dated = _rows_with_dates(ws)
-        last_date = max(dated.values())
+        # Дата уже есть — добавляем строку после последней строки этого дня
+        last_day_row = _last_row_of_day(ws, first_row)
+
+        # Определяем: этот день последний в таблице?
+        dated_rows = {}
+        for r in range(4, ws.max_row + 1):
+            d = _cell_as_date(ws.cell(row=r, column=1))
+            if d is not None:
+                dated_rows[r] = d
+
+        last_date = max(dated_rows.values()) if dated_rows else target_date
 
         if target_date >= last_date:
-            # Этот день последний — просто добавляем строку в самый конец без insert_rows
+            # Последний день — просто добавляем в конец
             row_idx = _last_used_row(ws) + 1
             _apply_row_style(ws, row_idx)
         else:
-            # Этот день в середине таблицы — ищем последнюю строку этого дня
-            last_row_of_day = first_row
-            next_row = first_row + 1
-            while next_row <= ws.max_row:
-                if ws.cell(row=next_row, column=1).value:
-                    break
-                has_data = any(
-                    ws.cell(row=next_row, column=c).value not in (None, "")
-                    for c in range(2, 5)
-                )
-                if has_data:
-                    last_row_of_day = next_row
-                next_row += 1
-            # Вставляем строку через insert_rows чтобы не затереть следующий день
-            insert_at = last_row_of_day + 1
+            # День в середине — insert_rows
+            insert_at = last_day_row + 1
             ws.insert_rows(insert_at)
             _apply_row_style(ws, insert_at)
             row_idx = insert_at
@@ -201,24 +205,23 @@ def get_totals(year: int) -> dict:
     total_income = 0
     total_expense = 0
     for row in ws.iter_rows(min_row=4, values_only=True):
-        income  = _parse_money(row[1]) if row[1] else 0
-        expense = _parse_money(row[2]) if row[2] else 0
-        if income:
-            total_income  += income
-        if expense:
-            total_expense += expense
-    return {"income": total_income, "expense": total_expense, "balance": total_income - total_expense}
+        total_income  += _parse_money(row[1])
+        total_expense += _parse_money(row[2])
+    return {
+        "income": total_income,
+        "expense": total_expense,
+        "balance": total_income - total_expense,
+    }
 
 
 def get_day_info(target_date: date) -> dict:
-    """Есть ли уже записи за этот день."""
     wb = load_workbook(EXCEL_FILE)
     sheet_name = _get_sheet_name(target_date.year)
     if sheet_name not in wb.sheetnames:
         return {"date": target_date, "has_records": False}
     ws = wb[sheet_name]
-    row_idx = _find_row_by_date(ws, target_date)
-    return {"date": target_date, "has_records": row_idx is not None}
+    has = _find_row_by_date(ws, target_date) is not None
+    return {"date": target_date, "has_records": has}
 
 
 def replace_excel_file(new_file_path: str):

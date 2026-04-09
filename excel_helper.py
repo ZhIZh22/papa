@@ -78,11 +78,13 @@ def _rows_with_dates(ws) -> dict:
 
 
 def _find_row_by_date(ws, target_date: date) -> int | None:
-    date_str = target_date.strftime("%d.%m.%y")
+    """Ищет строку по дате, поддерживает оба формата: ДД.ММ.ГГ и ДД.ММ.ГГГГ."""
     for row_idx in range(4, ws.max_row + 1):
         val = ws.cell(row=row_idx, column=1).value
-        if val and str(val).strip() == date_str:
-            return row_idx
+        if val:
+            d = _parse_date(str(val).strip())
+            if d == target_date:
+                return row_idx
     return None
 
 

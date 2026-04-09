@@ -509,7 +509,9 @@ def main():
     app = builder.build()
 
     # Flush pending при старте
-    app.job_queue.run_once(lambda ctx: flush_pending(app), when=0)
+    async def _flush_job(ctx):
+        await flush_pending(app)
+    app.job_queue.run_once(_flush_job, when=1)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("totals", cmd_totals))

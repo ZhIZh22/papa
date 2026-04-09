@@ -66,26 +66,9 @@ def _ensure_sheet(wb, sheet_name: str):
         ws["C1"] = "Расход"
         ws["D1"] = "Комментарий"
         ws["A2"] = "Итого:"
-        ws["B2"] = 0
-        ws["C2"] = 0
         ws["A3"] = "Остаток:"
-        ws["B3"] = 0
     return wb[sheet_name]
 
-
-def _recalc_totals(ws):
-    total_income = 0
-    total_expense = 0
-    for row in ws.iter_rows(min_row=4, values_only=True):
-        income  = _parse_money(row[1]) if row[1] else 0
-        expense = _parse_money(row[2]) if row[2] else 0
-        if income:
-            total_income  += income
-        if expense:
-            total_expense += expense
-    ws["B2"] = _format_money(total_income)
-    ws["C2"] = _format_money(total_expense)
-    ws["B3"] = _format_money(total_income - total_expense)
 
 
 def _last_data_row(ws) -> int:
@@ -188,7 +171,6 @@ def add_transaction(target_date: date, amount: int, comment: str = "") -> dict:
     # Применяем стиль к строке
     _apply_row_style(ws, row_idx)
 
-    _recalc_totals(ws)
     wb.save(EXCEL_FILE)
     return get_totals(target_date.year)
 
@@ -199,10 +181,16 @@ def get_totals(year: int) -> dict:
     if sheet_name not in wb.sheetnames:
         return {"income": 0, "expense": 0, "balance": 0}
     ws = wb[sheet_name]
-    income  = _parse_money(ws["B2"].value) or 0
-    expense = _parse_money(ws["C2"].value) or 0
-    balance = _parse_money(ws["B3"].value) or (income - expense)
-    return {"income": income, "expense": expense, "balance": balance}
+    total_income = 0
+    total_expense = 0
+    for row in ws.iter_rows(min_row=4, values_only=True):
+        income  = _parse_money(row[1]) if row[1] else 0
+        expense = _parse_money(row[2]) if row[2] else 0
+        if income:
+            total_income  += income
+        if expense:
+            total_expense += expense
+    return {"income": total_income, "expense": total_expense, "balance": total_income - total_expense}
 
 
 def get_day_info(target_date: date) -> dict:

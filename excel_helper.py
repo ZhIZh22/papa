@@ -113,38 +113,54 @@ def _find_row_by_date(ws, target_date: date) -> int | None:
 
 def _find_or_create_date_row(ws, target_date: date) -> int:
     """
-    Находит строку с нужной датой или вставляет новую.
-    Если дата позже последней — добавляет пустые строки-заглушки
-    для каждого пропущенного дня между последней датой и новой.
+    Находит строку с нужной датой или вставляет новую в правильное место.
+    - Дата позже последней: добавляет пустые строки для каждого пропущенного дня.
+    - Дата раньше последней: вставляет строку между соседними датами.
+    - Нет данных: просто добавляет строку после строки 3.
     """
     # Уже есть?
     existing = _find_row_by_date(ws, target_date)
     if existing:
         return existing
 
-    last_row  = _last_data_row(ws)
-    last_date = _last_date_in_sheet(ws)
+    # Собираем все строки с датами: {номер_строки: date}
+    rows_with_dates = {}
+    for row_idx in range(4, ws.max_row + 1):
+        val = ws.cell(row=row_idx, column=1).value
+        if val:
+            d = _parse_date(str(val).strip())
+            if d:
+                rows_with_dates[row_idx] = d
 
-    if last_date and target_date > last_date:
-        # Вставляем пустые строки для пропущенных дней
-        current_row = last_row
-        d = last_date + timedelta(days=1)
-        while d <= target_date:
-            current_row += 1
-            if d == target_date:
-                ws.cell(row=current_row, column=1).value = d.strftime("%d.%m.%y")
-                _apply_row_style(ws, current_row)
-            else:
-                # Пустая строка-заглушка (без даты, только стиль)
-                _apply_row_style(ws, current_row)
-            d += timedelta(days=1)
-        return current_row
-    else:
-        # Дата в прошлом или нет данных — просто добавляем снизу
+    if not rows_with_dates:
+        # Нет данных — первая запись
+        ws.cell(row=4, column=1).value = target_date.strftime("%d.%m.%y")
+        _apply_row_style(ws, 4)
+        return 4
+
+    last_row  = _last_data_row(ws)
+    last_date = max(rows_with_dates.values())
+
+    # Для любой даты (прошлое или будущее) — ищем ближайшую строку ДО target_date
+    # и вставляем новую строку сразу после неё.
+    insert_after_row = 3  # по умолчанию сразу после заголовков
+    for row_idx in sorted(rows_with_dates.keys()):
+        if rows_with_dates[row_idx] < target_date:
+            insert_after_row = row_idx
+
+    if target_date > last_date:
+        # Дата позже всех — добавляем в конец (не вставляем, чтобы не сдвигать)
         new_row = last_row + 1
         ws.cell(row=new_row, column=1).value = target_date.strftime("%d.%m.%y")
         _apply_row_style(ws, new_row)
         return new_row
+
+    # Дата в середине или в начале — вставляем строку
+    insert_at = insert_after_row + 1
+    ws.insert_rows(insert_at)
+    ws.cell(row=insert_at, column=1).value = target_date.strftime("%d.%m.%y")
+    _apply_row_style(ws, insert_at)
+    return insert_at
 
 
 def add_transaction(target_date: date, amount: int, comment: str = "") -> dict:
@@ -156,10 +172,10 @@ def add_transaction(target_date: date, amount: int, comment: str = "") -> dict:
 
     if amount > 0:
         existing = _parse_money(ws.cell(row=row_idx, column=2).value) or 0
-        ws.cell(row=row_idx, column=2).value = _format_money(existing + amount)
+        ws.cell(row=row_idx, column=2).value = existing + amount
     else:
         existing = _parse_money(ws.cell(row=row_idx, column=3).value) or 0
-        ws.cell(row=row_idx, column=3).value = _format_money(existing + abs(amount))
+        ws.cell(row=row_idx, column=3).value = existing + abs(amount)
 
     if comment:
         existing_comment = ws.cell(row=row_idx, column=4).value or ""

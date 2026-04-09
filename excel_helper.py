@@ -103,29 +103,23 @@ def _insert_new_row_for_date(ws, target_date: date) -> int:
 
     last_date = max(dated.values())
 
-    if target_date > last_date:
-        # Добавляем в конец после последней использованной строки
+    if target_date >= last_date:
+        # Дата позже или равна последней — добавляем в конец после последней использованной строки
         row = _last_used_row(ws) + 1
         ws.cell(row=row, column=1).value = target_date.strftime("%d.%m.%y")
         _apply_row_style(ws, row)
         return row
 
-    # Вставляем в нужное место: после последней строки с датой < target_date
+    # Дата раньше последней — вставляем в нужное место через insert_rows
     insert_after = 3
     for row_idx in sorted(dated.keys()):
         if dated[row_idx] < target_date:
+            # Учитываем все строки этого дня (без даты в A)
             insert_after = row_idx
-        elif dated[row_idx] == target_date:
-            # Дата уже есть — найдём последнюю строку этого дня (без даты в A)
-            # и вставим после неё
-            insert_after = row_idx
-            # Идём вниз пока строки без даты относятся к этому дню
             next_row = row_idx + 1
             while next_row <= ws.max_row:
-                next_val = ws.cell(row=next_row, column=1).value
-                if next_val:  # следующая дата
+                if ws.cell(row=next_row, column=1).value:
                     break
-                # Есть ли данные в строке?
                 has_data = any(
                     ws.cell(row=next_row, column=c).value not in (None, "")
                     for c in range(2, 5)
@@ -133,7 +127,6 @@ def _insert_new_row_for_date(ws, target_date: date) -> int:
                 if has_data:
                     insert_after = next_row
                 next_row += 1
-            break
 
     insert_at = insert_after + 1
     ws.insert_rows(insert_at)
@@ -159,26 +152,32 @@ def add_transaction(target_date: date, amount: int, comment: str = "") -> dict:
         # Даты нет вообще — вставляем новую строку с датой
         row_idx = _insert_new_row_for_date(ws, target_date)
     else:
-        # Дата есть — ищем последнюю строку этого дня
-        last_row_of_day = first_row
-        next_row = first_row + 1
-        while next_row <= ws.max_row:
-            next_val = ws.cell(row=next_row, column=1).value
-            if next_val:  # начался следующий день
-                break
-            has_data = any(
-                ws.cell(row=next_row, column=c).value not in (None, "")
-                for c in range(2, 5)
-            )
-            if has_data:
-                last_row_of_day = next_row
-            next_row += 1
+        dated = _rows_with_dates(ws)
+        last_date = max(dated.values())
 
-        # Вставляем новую строку после последней строки этого дня (без даты)
-        insert_at = last_row_of_day + 1
-        ws.insert_rows(insert_at)
-        _apply_row_style(ws, insert_at)
-        row_idx = insert_at
+        if target_date >= last_date:
+            # Этот день последний — просто добавляем строку в самый конец без insert_rows
+            row_idx = _last_used_row(ws) + 1
+            _apply_row_style(ws, row_idx)
+        else:
+            # Этот день в середине таблицы — ищем последнюю строку этого дня
+            last_row_of_day = first_row
+            next_row = first_row + 1
+            while next_row <= ws.max_row:
+                if ws.cell(row=next_row, column=1).value:
+                    break
+                has_data = any(
+                    ws.cell(row=next_row, column=c).value not in (None, "")
+                    for c in range(2, 5)
+                )
+                if has_data:
+                    last_row_of_day = next_row
+                next_row += 1
+            # Вставляем строку через insert_rows чтобы не затереть следующий день
+            insert_at = last_row_of_day + 1
+            ws.insert_rows(insert_at)
+            _apply_row_style(ws, insert_at)
+            row_idx = insert_at
 
     # Записываем сумму
     if amount > 0:

@@ -1,27 +1,43 @@
 import os
 import re
-from datetime import date, datetime
+import shutil
+from datetime import date, datetime, timedelta
 from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Border, Side
 
 EXCEL_FILE = os.getenv("EXCEL_FILE", "!!!Мастерская.xlsx")
 
+# Тонкая боковая граница (как на скриншоте)
+_THIN = Side(style="thin")
+_BORDER_SIDES = Border(left=_THIN, right=_THIN)  # только левая и правая полоски
+_BORDER_COMMENT = Border(left=_THIN, right=_THIN)
+
+_ALIGN_CENTER = Alignment(horizontal="center", vertical="center")
+_ALIGN_LEFT   = Alignment(horizontal="left",   vertical="center")
+
+
+def _apply_row_style(ws, row_idx: int):
+    """Применяет стиль (выравнивание + боковые границы) к строке данных."""
+    for col in range(1, 5):
+        cell = ws.cell(row=row_idx, column=col)
+        cell.border = _BORDER_SIDES
+        if col == 4:
+            cell.alignment = _ALIGN_LEFT
+        else:
+            cell.alignment = _ALIGN_CENTER
+
 
 def _get_sheet_name(year: int) -> str:
-    """Возвращает имя листа для года (например, 2026 -> '26')."""
     return str(year)[-2:]
 
 
 def _format_money(value) -> str:
-    """Форматирует число в строку с пробелами между разрядами."""
     if value is None:
         return ""
     try:
         n = int(value)
     except (ValueError, TypeError):
         return str(value)
-    # Форматируем с пробелами: 1 234 567
     result = []
     s = str(abs(n))
     for i, ch in enumerate(reversed(s)):
@@ -32,8 +48,9 @@ def _format_money(value) -> str:
     return ("-" + formatted) if n < 0 else formatted
 
 
-def _parse_money(s: str):
-    """Парсит строку с деньгами в int."""
+def _parse_money(s):
+    if s is None:
+        return None
     s = str(s).replace(" ", "").replace("\xa0", "")
     try:
         return int(s)
@@ -42,33 +59,28 @@ def _parse_money(s: str):
 
 
 def _ensure_sheet(wb, sheet_name: str):
-    """Создаёт лист года если его нет, с нужными заголовками и формулами."""
     if sheet_name not in wb.sheetnames:
         ws = wb.create_sheet(title=sheet_name)
-        # Строка 1 — заголовки столбцов
         ws["A1"] = "Дата"
         ws["B1"] = "Приход"
         ws["C1"] = "Расход"
         ws["D1"] = "Комментарий"
-        # Строка 2 — суммы
         ws["A2"] = "Итого:"
-        ws["B2"] = 0  # сумма доходов — будем обновлять вручную
-        ws["C2"] = 0  # сумма расходов
-        # Строка 3 — остаток
+        ws["B2"] = 0
+        ws["C2"] = 0
         ws["A3"] = "Остаток:"
-        ws["B3"] = 0  # остаток
+        ws["B3"] = 0
     return wb[sheet_name]
 
 
 def _recalc_totals(ws):
-    """Пересчитывает суммы в строках 2 и 3."""
     total_income = 0
     total_expense = 0
     for row in ws.iter_rows(min_row=4, values_only=True):
-        income = _parse_money(row[1]) if row[1] else 0
+        income  = _parse_money(row[1]) if row[1] else 0
         expense = _parse_money(row[2]) if row[2] else 0
         if income:
-            total_income += income
+            total_income  += income
         if expense:
             total_expense += expense
     ws["B2"] = _format_money(total_income)
@@ -76,36 +88,83 @@ def _recalc_totals(ws):
     ws["B3"] = _format_money(total_income - total_expense)
 
 
-def _find_or_create_date_row(ws, target_date: date) -> int:
-    """
-    Находит строку с нужной датой или создаёт новую строку ниже последней.
-    Возвращает номер строки.
-    """
-    date_str = target_date.strftime("%d.%m.%y")
-
-    # Ищем существующую строку с этой датой
-    for row_idx in range(4, ws.max_row + 1):
-        cell_val = ws.cell(row=row_idx, column=1).value
-        if cell_val and str(cell_val).strip() == date_str:
-            return row_idx
-
-    # Находим последнюю заполненную строку
-    last_row = 3
+def _last_data_row(ws) -> int:
+    """Возвращает номер последней строки с датой (>= 4), или 3 если данных нет."""
+    last = 3
     for row_idx in range(4, ws.max_row + 1):
         if ws.cell(row=row_idx, column=1).value:
-            last_row = row_idx
+            last = row_idx
+    return last
 
-    new_row = last_row + 1
-    ws.cell(row=new_row, column=1).value = date_str
-    return new_row
+
+def _last_date_in_sheet(ws) -> date | None:
+    """Возвращает последнюю дату из столбца A (строки >= 4)."""
+    last_date = None
+    for row_idx in range(4, ws.max_row + 1):
+        val = ws.cell(row=row_idx, column=1).value
+        if val:
+            d = _parse_date(str(val).strip())
+            if d and (last_date is None or d > last_date):
+                last_date = d
+    return last_date
+
+
+def _parse_date(s: str) -> date | None:
+    for fmt in ("%d.%m.%y", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _find_row_by_date(ws, target_date: date) -> int | None:
+    """Ищет строку с нужной датой. Возвращает номер или None."""
+    date_str = target_date.strftime("%d.%m.%y")
+    for row_idx in range(4, ws.max_row + 1):
+        val = ws.cell(row=row_idx, column=1).value
+        if val and str(val).strip() == date_str:
+            return row_idx
+    return None
+
+
+def _find_or_create_date_row(ws, target_date: date) -> int:
+    """
+    Находит строку с нужной датой или вставляет новую.
+    Если дата позже последней — добавляет пустые строки-заглушки
+    для каждого пропущенного дня между последней датой и новой.
+    """
+    # Уже есть?
+    existing = _find_row_by_date(ws, target_date)
+    if existing:
+        return existing
+
+    last_row  = _last_data_row(ws)
+    last_date = _last_date_in_sheet(ws)
+
+    if last_date and target_date > last_date:
+        # Вставляем пустые строки для пропущенных дней
+        current_row = last_row
+        d = last_date + timedelta(days=1)
+        while d <= target_date:
+            current_row += 1
+            if d == target_date:
+                ws.cell(row=current_row, column=1).value = d.strftime("%d.%m.%y")
+                _apply_row_style(ws, current_row)
+            else:
+                # Пустая строка-заглушка (без даты, только стиль)
+                _apply_row_style(ws, current_row)
+            d += timedelta(days=1)
+        return current_row
+    else:
+        # Дата в прошлом или нет данных — просто добавляем снизу
+        new_row = last_row + 1
+        ws.cell(row=new_row, column=1).value = target_date.strftime("%d.%m.%y")
+        _apply_row_style(ws, new_row)
+        return new_row
 
 
 def add_transaction(target_date: date, amount: int, comment: str = "") -> dict:
-    """
-    Добавляет транзакцию в Excel.
-    amount > 0 — доход, amount < 0 — расход.
-    Возвращает словарь с итогами листа.
-    """
     wb = load_workbook(EXCEL_FILE)
     sheet_name = _get_sheet_name(target_date.year)
     ws = _ensure_sheet(wb, sheet_name)
@@ -113,15 +172,12 @@ def add_transaction(target_date: date, amount: int, comment: str = "") -> dict:
     row_idx = _find_or_create_date_row(ws, target_date)
 
     if amount > 0:
-        # Доход — столбец B
         existing = _parse_money(ws.cell(row=row_idx, column=2).value) or 0
         ws.cell(row=row_idx, column=2).value = _format_money(existing + amount)
     else:
-        # Расход — столбец C (сохраняем как положительное число)
         existing = _parse_money(ws.cell(row=row_idx, column=3).value) or 0
         ws.cell(row=row_idx, column=3).value = _format_money(existing + abs(amount))
 
-    # Комментарий
     if comment:
         existing_comment = ws.cell(row=row_idx, column=4).value or ""
         if existing_comment:
@@ -129,66 +185,40 @@ def add_transaction(target_date: date, amount: int, comment: str = "") -> dict:
         else:
             ws.cell(row=row_idx, column=4).value = comment
 
+    # Применяем стиль к строке
+    _apply_row_style(ws, row_idx)
+
     _recalc_totals(ws)
     wb.save(EXCEL_FILE)
-
     return get_totals(target_date.year)
 
 
-def add_comment_to_date(target_date: date, comment: str) -> bool:
-    """Добавляет комментарий к существующей строке даты."""
-    wb = load_workbook(EXCEL_FILE)
-    sheet_name = _get_sheet_name(target_date.year)
-    if sheet_name not in wb.sheetnames:
-        return False
-    ws = wb[sheet_name]
-
-    date_str = target_date.strftime("%d.%m.%y")
-    for row_idx in range(4, ws.max_row + 1):
-        cell_val = ws.cell(row=row_idx, column=1).value
-        if cell_val and str(cell_val).strip() == date_str:
-            existing_comment = ws.cell(row=row_idx, column=4).value or ""
-            if existing_comment:
-                ws.cell(row=row_idx, column=4).value = existing_comment + ", " + comment
-            else:
-                ws.cell(row=row_idx, column=4).value = comment
-            wb.save(EXCEL_FILE)
-            return True
-    return False
-
-
 def get_totals(year: int) -> dict:
-    """Возвращает итоги за год: доход, расход, остаток."""
     wb = load_workbook(EXCEL_FILE)
     sheet_name = _get_sheet_name(year)
     if sheet_name not in wb.sheetnames:
         return {"income": 0, "expense": 0, "balance": 0}
     ws = wb[sheet_name]
-    income = _parse_money(ws["B2"].value) or 0
+    income  = _parse_money(ws["B2"].value) or 0
     expense = _parse_money(ws["C2"].value) or 0
     balance = _parse_money(ws["B3"].value) or (income - expense)
     return {"income": income, "expense": expense, "balance": balance}
 
 
 def get_day_info(target_date: date) -> dict:
-    """Возвращает данные за конкретный день."""
     wb = load_workbook(EXCEL_FILE)
     sheet_name = _get_sheet_name(target_date.year)
     if sheet_name not in wb.sheetnames:
         return {"date": target_date, "income": 0, "expense": 0, "comment": ""}
     ws = wb[sheet_name]
-    date_str = target_date.strftime("%d.%m.%y")
-    for row_idx in range(4, ws.max_row + 1):
-        cell_val = ws.cell(row=row_idx, column=1).value
-        if cell_val and str(cell_val).strip() == date_str:
-            income = _parse_money(ws.cell(row=row_idx, column=2).value) or 0
-            expense = _parse_money(ws.cell(row=row_idx, column=3).value) or 0
-            comment = ws.cell(row=row_idx, column=4).value or ""
-            return {"date": target_date, "income": income, "expense": expense, "comment": comment}
+    row_idx = _find_row_by_date(ws, target_date)
+    if row_idx:
+        income  = _parse_money(ws.cell(row=row_idx, column=2).value) or 0
+        expense = _parse_money(ws.cell(row=row_idx, column=3).value) or 0
+        comment = ws.cell(row=row_idx, column=4).value or ""
+        return {"date": target_date, "income": income, "expense": expense, "comment": comment}
     return {"date": target_date, "income": 0, "expense": 0, "comment": ""}
 
 
 def replace_excel_file(new_file_path: str):
-    """Заменяет рабочий Excel файл новым."""
-    import shutil
     shutil.copy2(new_file_path, EXCEL_FILE)
